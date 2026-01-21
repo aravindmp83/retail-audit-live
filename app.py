@@ -4,7 +4,7 @@ import requests
 import base64
 import json
 import io
-import time  # <--- ADD THIS
+import time
 from PIL import Image
 from datetime import datetime
 from supabase import create_client, Client
@@ -26,7 +26,20 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 st.set_page_config(page_title="Trends Audit V2", page_icon="✅", layout="wide")
 
 # ---------------------------------------------------------
-# LOGIC: AI Analysis (Updated to Fix 404 Errors)
+# HELPER: Check Available Models (Diagnostic)
+# ---------------------------------------------------------
+def get_available_models():
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GOOGLE_API_KEY}"
+    try:
+        response = requests.get(url)
+        if response.status_code == 200:
+            return [m['name'].replace("models/", "") for m in response.json().get('models', [])]
+        return []
+    except:
+        return []
+
+# ---------------------------------------------------------
+# LOGIC: AI Analysis (With Auto-Failover & Diagnostics)
 # ---------------------------------------------------------
 def analyze_image(image, prompt_override=None):
     buffered = io.BytesIO()
@@ -73,9 +86,9 @@ def analyze_image(image, prompt_override=None):
     Category: [Name] | Result: [PASS/FAIL] | Reason: [One short sentence]
     """
 
-    # PRIORITY LIST: Flash -> Flash-8b -> Pro -> Pro-002
-    # We added more aliases to ensure one ALWAYS works
-    models_to_try = ["gemini-1.5-flash", "gemini-1.5-flash-002", "gemini-1.5-flash-8b", "gemini-1.5-pro"]
+    # PRIORITY LIST: Flash -> Pro -> Legacy (gemini-pro)
+    # We try widely different versions to ensure ONE works.
+    models_to_try = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]
     
     for model_name in models_to_try:
         try:
@@ -87,13 +100,14 @@ def analyze_image(image, prompt_override=None):
             if response.status_code == 200:
                 return response.json()['candidates'][0]['content']['parts'][0]['text']
             
-            # THE FIX: Added 404 to this list so it tries the next model instead of quitting
-            elif response.status_code in [429, 503, 404]:
+            # If 404 (Not Found) or 429/503 (Busy), keep trying
+            elif response.status_code in [404, 429, 503]:
                 time.sleep(1)
                 continue
             
             else:
-                return f"AI Error {response.status_code}"
+                # If it's a hard error (e.g. 400), return it so we know
+                return f"AI Error {response.status_code}: {response.text}"
                 
         except Exception as e:
             time.sleep(1)
@@ -102,17 +116,20 @@ def analyze_image(image, prompt_override=None):
     return "System Busy. Please wait 30 seconds and try again."
 
 # ---------------------------------------------------------
-# OPTIMIZED LOGIC: Cloud Storage (With Auto-Category Parsing)
+# OPTIMIZED LOGIC: Cloud Storage & Parsing
 # ---------------------------------------------------------
 def save_audit_to_cloud(store_code, mgr_name, result_text, image):
     try:
-        # 1. Parse the AI Response (Format: "Category: X | Result: Y | Reason: Z")
-        # Set defaults in case AI output is messy
+        # 1. Parse the AI Response
         category = "General"
-        status = "FAIL"
+        status = "FAIL" # Default to FAIL for safety
         reason = result_text
 
-        if "|" in result_text:
+        # FIXED LOGIC: If AI reports error/busy, force FAIL
+        if "Error" in result_text or "System Busy" in result_text:
+            status = "FAIL"
+            reason = "System Error - Please Retry"
+        elif "|" in result_text:
             parts = result_text.split("|")
             for part in parts:
                 if "Category:" in part:
@@ -122,7 +139,7 @@ def save_audit_to_cloud(store_code, mgr_name, result_text, image):
                 if "Reason:" in part:
                     reason = part.replace("Reason:", "").strip()
         else:
-            # Fallback for simple "FAIL" responses
+            # Fallback
             status = "FAIL" if "FAIL" in result_text.upper() else "PASS"
 
         # 2. Compress Image
@@ -143,11 +160,11 @@ def save_audit_to_cloud(store_code, mgr_name, result_text, image):
         )
         img_url = supabase.storage.from_("audit-photos").get_public_url(filename)
 
-        # 4. Insert Data (With the new Category!)
+        # 4. Insert Data
         data = {
             "store_code": store_code,
             "manager_name": mgr_name,
-            "audit_type": category,   # <--- Saving the auto-detected category
+            "audit_type": category,
             "result": status,
             "reason": reason,
             "image_url": img_url,
@@ -177,7 +194,18 @@ def load_store_data():
 def main():
     st.title("✅ Trends Store Audit V2")
 
-    # Sidebar for navigation
+    # --- SIDEBAR DIAGNOSTIC (Hidden Helper) ---
+    with st.sidebar:
+        st.write("🔧 **System Check**")
+        if st.button("Check Connectivity"):
+            models = get_available_models()
+            if models:
+                st.success(f"Access OK. Found {len(models)} models.")
+                with st.expander("View Models"):
+                    st.write(models)
+            else:
+                st.error("No models found. Check API Key.")
+
     role = st.sidebar.radio("Select Role", ["Store Manager", "Cluster Manager"])
 
     if role == "Store Manager":
@@ -205,77 +233,59 @@ def store_manager_interface():
     else:
         st.info(f"Store: {st.session_state['code']} | Manager: {st.session_state['mgr']}")
         st.header("📸 Smart Audit")
-        
-        # Nudge Reminder
         st.warning("🔔 Remember to complete audits at 11:30 AM, 2:30 PM, 5:00 PM, and 7:00 PM daily.")
 
         img_input = st.camera_input("Take Photo")
         
-        # --- FIXED LOGIC STARTS HERE ---
         if img_input and st.button("Run Smart Audit"):
             with st.spinner("AI is classifying and auditing..."):
                 image = Image.open(img_input)
-                
-                # 1. Run AI
                 result_text = analyze_image(image)
                 
-                if "AI Error" not in result_text:
-                    # 2. Save & Parse (Returns 4 values)
-                    success, status, category, reason = save_audit_to_cloud(
-                        st.session_state['code'], 
-                        st.session_state['mgr'], 
-                        result_text, 
-                        image
-                    )
+                # We SAVE regardless of error to track issues
+                success, status, category, reason = save_audit_to_cloud(
+                    st.session_state['code'], 
+                    st.session_state['mgr'], 
+                    result_text, 
+                    image
+                )
+                
+                if success:
+                    st.divider()
+                    st.subheader(f"Detected: {category}")
                     
-                    if success:
-                        # 3. Show Result Card
-                        st.divider()
-                        st.subheader(f"Detected: {category}")
-                        
-                        if status == "PASS":
-                            st.success(f"✅ PASS")
-                            st.write(f"**Reason:** {reason}")
-                        else:
-                            st.error(f"❌ FAIL")
-                            st.write(f"**Reason:** {reason}")
-                            st.info("Action: Please fix the issue and re-audit.")
+                    if status == "PASS":
+                        st.success(f"✅ PASS")
+                        st.write(f"**Reason:** {reason}")
                     else:
-                        st.error(f"Cloud Upload Failed: {status}")
+                        st.error(f"❌ FAIL / ERROR")
+                        st.write(f"**Reason:** {reason}")
+                        st.info("Action: Please fix the issue (or wait if System Error) and re-audit.")
                 else:
-                    st.error(result_text)
-# ---------------------------------------------------------
-# UI: Cluster Manager Interface (Fixed & Clean)
-# ---------------------------------------------------------
+                    st.error(f"Cloud Upload Failed: {status}")
+
+        if st.button("Logout"):
+            st.session_state['logged_in'] = False
+            st.rerun()
+
 def cluster_manager_interface():
     st.header("👀 Cluster Manager View")
-    
-    # 1. Load Data to get Manager Names
     df_stores = load_store_data()
     if df_stores is not None:
-        # Auto-detect the Cluster Manager column name
-        # It looks for "Cluster" or "CM" in column names, defaults to "Cluster Manager"
         cm_col = next((col for col in df_stores.columns if "Cluster" in col or "CM" in col), "Cluster Manager")
-        
-        # Check if column exists
         if cm_col not in df_stores.columns:
-            st.error(f"Error: Could not find a column named '{cm_col}' in stores.csv. Please check your CSV headers.")
+            st.error(f"Error: Could not find '{cm_col}' column.")
             return
 
-        # Create Dropdown
         cms = df_stores[cm_col].dropna().unique().tolist()
         cms.sort()
         selected_cm = st.selectbox("Select Your Name", cms)
         
         if st.button("Load My Stores"):
-            # Get list of stores for this CM
             my_stores = df_stores[df_stores[cm_col] == selected_cm]['Store Code'].astype(str).tolist()
-            
-            # Query Supabase
             today = datetime.now().strftime("%Y-%m-%d")
             try:
                 with st.spinner(f"Fetching audits for {selected_cm}..."):
-                    # Fetch today's logs
                     response = supabase.table("audit_logs").select("*") \
                         .filter("created_at", "gte", f"{today}T00:00:00") \
                         .order("created_at", desc=True).execute()
@@ -283,12 +293,9 @@ def cluster_manager_interface():
                 data = response.data
                 if data:
                     df_logs = pd.DataFrame(data)
-                    
-                    # Filter: Keep only this CM's stores
                     df_logs = df_logs[df_logs['store_code'].isin(my_stores)]
                     
                     if not df_logs.empty:
-                        # Metrics
                         st.metric("My Stores Audited", len(df_logs))
                         fails = len(df_logs[df_logs['result'] == 'FAIL'])
                         st.metric("Action Required", fails, delta=-fails, delta_color="inverse")
@@ -297,18 +304,15 @@ def cluster_manager_interface():
                         st.subheader(f"Detailed Logs ({len(df_logs)})")
                         
                         for index, row in df_logs.iterrows():
-                            # TIMEZONE CONVERSION (UTC -> IST)
                             try:
                                 utc_time = datetime.fromisoformat(row['created_at'].replace('Z', '+00:00'))
-                                # Manual offset for IST (+5:30)
                                 from datetime import timedelta, timezone
                                 ist_offset = timezone(timedelta(hours=5, minutes=30))
                                 ist_time = utc_time.astimezone(ist_offset)
                                 fmt_time = ist_time.strftime("%I:%M %p") 
                             except:
-                                fmt_time = row['created_at'] # Fallback if time parsing fails
+                                fmt_time = row['created_at']
 
-                            # Format Header: Store - Audit Type - Result
                             label = f"{row['store_code']} - {row['audit_type']} - {row['result']}"
                             
                             with st.expander(f"{fmt_time} | {label}"):
