@@ -1,3 +1,4 @@
+import time
 import streamlit as st
 import pandas as pd
 import requests
@@ -25,10 +26,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 st.set_page_config(page_title="Trends Audit V2", page_icon="✅", layout="wide")
 
 # ---------------------------------------------------------
-# LOGIC: AI Analysis (Direct API)
-# ---------------------------------------------------------
-# ---------------------------------------------------------
-# LOGIC: AI Analysis (Smart Auto-Classification)
+# LOGIC: AI Analysis (With "Patience" & Auto-Failover)
 # ---------------------------------------------------------
 def analyze_image(image, prompt_override=None):
     buffered = io.BytesIO()
@@ -36,7 +34,6 @@ def analyze_image(image, prompt_override=None):
     img_base64 = base64.b64encode(buffered.getvalue()).decode()
     
     # THE "SMART" PROMPT
-    # We give the AI the rulebook here.
     system_prompt = """
     You are a strict retail store auditor for 'Trends'. Analyze this image.
     
@@ -76,21 +73,32 @@ def analyze_image(image, prompt_override=None):
     Category: [Name] | Result: [PASS/FAIL] | Reason: [One short sentence]
     """
 
-    try:
-        discovery_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GOOGLE_API_KEY}"
-        models = requests.get(discovery_url).json().get('models', [])
-        # Prefer "Flash" for speed, fall back to Pro
-        model_name = next((m['name'].replace("models/", "") for m in models if "flash" in m['name']), "gemini-1.5-pro")
-        
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GOOGLE_API_KEY}"
-        payload = {"contents": [{"parts": [{"text": system_prompt}, {"inline_data": {"mime_type": "image/jpeg", "data": img_base64}}]}]}
-        
-        response = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload)
-        if response.status_code == 200:
-            return response.json()['candidates'][0]['content']['parts'][0]['text']
-        return f"AI Error {response.status_code}"
-    except Exception as e:
-        return f"Connection Error: {e}"
+    # PRIORITY LIST: Flash (Fastest) -> Flash-8b (Backup) -> Pro (Strongest)
+    models_to_try = ["gemini-1.5-flash", "gemini-1.5-flash-8b", "gemini-1.5-pro"]
+    
+    for model_name in models_to_try:
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GOOGLE_API_KEY}"
+            payload = {"contents": [{"parts": [{"text": system_prompt}, {"inline_data": {"mime_type": "image/jpeg", "data": img_base64}}]}]}
+            
+            response = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload)
+            
+            if response.status_code == 200:
+                return response.json()['candidates'][0]['content']['parts'][0]['text']
+            
+            elif response.status_code in [429, 503]:
+                # HIT TRAFFIC? WAIT 2 SECONDS AND TRY NEXT MODEL
+                time.sleep(2)
+                continue
+            
+            else:
+                return f"AI Error {response.status_code}"
+                
+        except Exception as e:
+            time.sleep(1)
+            continue
+
+    return "System Busy (Traffic High). Please wait 30 seconds and try again."
 
 # ---------------------------------------------------------
 # OPTIMIZED LOGIC: Cloud Storage (With Auto-Category Parsing)
