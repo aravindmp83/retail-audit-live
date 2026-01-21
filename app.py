@@ -1,10 +1,10 @@
-import time
 import streamlit as st
 import pandas as pd
 import requests
 import base64
 import json
 import io
+import time  # <--- ADD THIS
 from PIL import Image
 from datetime import datetime
 from supabase import create_client, Client
@@ -243,45 +243,90 @@ def store_manager_interface():
                         st.error(f"Cloud Upload Failed: {status}")
                 else:
                     st.error(result_text)
-
+# ---------------------------------------------------------
+# UI: Cluster Manager Interface (Filtered & IST Time)
+# ---------------------------------------------------------
 def cluster_manager_interface():
     st.header("👀 Cluster Manager View")
-    # Simple password protection for CM view for now
-    pwd = st.text_input("Enter CM Password", type="password")
-    if pwd == "admin123": # Change this!
-        if st.button("Refresh Today's Data"):
-            # Query Supabase for today's logs
+    
+    # 1. Load Data to get Manager Names
+    df_stores = load_store_data()
+    if df_stores is not None:
+        # Get unique Cluster Managers
+        # ASSUMPTION: Your CSV has a column like 'Cluster Manager' or 'CM Name'
+        # Let's try to find it dynamically or fallback to 'Cluster Manager'
+        cm_col = next((col for col in df_stores.columns if "Cluster" in col or "CM" in col), "Cluster Manager")
+        
+        if cm_col not in df_stores.columns:
+            st.error(f"Could not find a 'Cluster Manager' column in stores.csv. Found: {df_stores.columns.tolist()}")
+            return
+
+        # Create Dropdown
+        cms = df_stores[cm_col].unique().tolist()
+        cms.sort()
+        selected_cm = st.selectbox("Select Your Name", cms)
+        
+        if st.button("Load My Stores"):
+            # Get list of stores for this CM
+            my_stores = df_stores[df_stores[cm_col] == selected_cm]['Store Code'].astype(str).tolist()
+            
+            # Query Supabase (Fetch ALL today's logs, then filter in Python for speed)
             today = datetime.now().strftime("%Y-%m-%d")
             try:
-                response = supabase.table("audit_logs").select("*") \
-                    .filter("created_at", "gte", f"{today}T00:00:00") \
-                    .order("created_at", desc=True).execute()
+                with st.spinner(f"Fetching audits for {selected_cm}..."):
+                    response = supabase.table("audit_logs").select("*") \
+                        .filter("created_at", "gte", f"{today}T00:00:00") \
+                        .order("created_at", desc=True).execute()
                 
                 data = response.data
                 if data:
                     df_logs = pd.DataFrame(data)
                     
-                    # Metrics
-                    st.metric("Total Audits Today", len(df_logs))
-                    fails = len(df_logs[df_logs['result'] == 'FAIL'])
-                    st.metric("Failures", fails, delta=-fails, delta_color="inverse")
+                    # 2. FILTER: Keep only logs where store_code matches this CM's stores
+                    df_logs = df_logs[df_logs['store_code'].isin(my_stores)]
+                    
+                    if not df_logs.empty:
+                        # Metrics
+                        st.metric("My Stores Audited", len(df_logs))
+                        fails = len(df_logs[df_logs['result'] == 'FAIL'])
+                        st.metric("Action Required", fails, delta=-fails, delta_color="inverse")
 
-                    st.subheader("Detailed Logs")
-                    # Display data with images
-                    for index, row in df_logs.iterrows():
-                        with st.expander(f"{row['created_at'][11:16]} - Store {row['store_code']} - {row['result']}"):
-                            col1, col2 = st.columns([1, 2])
-                            with col1:
-                                if row['image_url']:
-                                    st.image(row['image_url'], width=200)
-                            with col2:
-                                st.write(f"**Manager:** {row['manager_name']}")
-                                st.write(f"**Reason:** {row['reason']}")
-                                if row['result'] == 'FAIL':
-                                    st.error("Action Required")
+                        st.divider()
+                        st.subheader(f"Detailed Logs ({len(df_logs)})")
+                        
+                        for index, row in df_logs.iterrows():
+                            # 3. TIMEZONE CONVERSION (UTC -> IST)
+                            utc_time = datetime.fromisoformat(row['created_at'].replace('Z', '+00:00'))
+                            ist_time = utc_time.astimezone(datetime.now().astimezone().tzinfo) # Auto-detect local TZ (IST server)
+                            # Manually force +5:30 just in case server is UTC
+                            from datetime import timedelta, timezone
+                            ist_offset = timezone(timedelta(hours=5, minutes=30))
+                            ist_time = utc_time.astimezone(ist_offset)
+                            
+                            fmt_time = ist_time.strftime("%I:%M %p") # e.g., 02:30 PM
+
+                            # 4. CUSTOM HEADER FORMAT
+                            # "Store Code - Audit Type - Result"
+                            label = f"{row['store_code']} - {row['audit_type']} - {row['result']}"
+                            
+                            with st.expander(f"{fmt_time} | {label}"):
+                                col1, col2 = st.columns([1, 2])
+                                with col1:
+                                    if row['image_url']:
+                                        st.image(row['image_url'], width=200)
+                                with col2:
+                                    st.write(f"**Manager:** {row['manager_name']}")
+                                    st.write(f"**Reason:** {row['reason']}")
+                                    if row['result'] == 'FAIL':
+                                        st.error("❌ Action Required")
+                                    else:
+                                        st.success("✅ Compliant")
+                    else:
+                        st.info(f"No audits submitted for {selected_cm}'s stores today yet.")
                 else:
-                    st.info("No audits conducted yet today.")
+                    st.info("No audits found in the system today.")
             except Exception as e:
+                st.error(f"Database Error: {e}")            except Exception as e:
                 st.error(f"Database Error: {e}")
 
 if __name__ == "__main__":
