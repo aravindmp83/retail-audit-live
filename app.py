@@ -29,7 +29,9 @@ st.set_page_config(page_title="Trends Audit Pilot", page_icon="🎯", layout="wi
 # LOGIC: Efficient AI Call (No Discovery Overhead)
 # ---------------------------------------------------------
 def analyze_image(image):
-    buffered = io.BytesIO()
+     image = image.copy()
+    image.thumbnail((640, 640))   # 🔥 resize BEFORE API call
+ buffered = io.BytesIO()
     image.save(buffered, format="JPEG")
     img_base64 = base64.b64encode(buffered.getvalue()).decode()
     
@@ -77,7 +79,7 @@ def analyze_image(image):
         
         # If Rate Limit (429) or Server Busy (503), wait and retry ONCE
         if response.status_code in [429, 503]:
-            time.sleep(5) # Wait 5 seconds
+            time.sleep(30) # Wait 30 seconds
             response = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload, timeout=15)
 
         if response.status_code == 200:
@@ -290,3 +292,4 @@ def cluster_manager_interface():
 
 if __name__ == "__main__":
     main()
+
