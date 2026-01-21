@@ -27,19 +27,63 @@ st.set_page_config(page_title="Trends Audit V2", page_icon="✅", layout="wide")
 # ---------------------------------------------------------
 # LOGIC: AI Analysis (Direct API)
 # ---------------------------------------------------------
-def analyze_image(image, prompt):
+# ---------------------------------------------------------
+# LOGIC: AI Analysis (Smart Auto-Classification)
+# ---------------------------------------------------------
+def analyze_image(image, prompt_override=None):
     buffered = io.BytesIO()
     image.save(buffered, format="JPEG")
     img_base64 = base64.b64encode(buffered.getvalue()).decode()
     
-    # Using auto-discovery of models to prevent 404s
+    # THE "SMART" PROMPT
+    # We give the AI the rulebook here.
+    system_prompt = """
+    You are a strict retail store auditor for 'Trends'. Analyze this image.
+    
+    STEP 1: CLASSIFY the image into exactly one of these 4 categories:
+    - 'Trial Room' (Look for desks, mirrors, cubicles)
+    - 'Staff Grooming' (Look for a person, uniform, ID card)
+    - 'Greeter' (Look for store entrance, security guard, welcome mat)
+    - 'Merchandise Display' (Look for shelves, folded clothes, mannequins)
+
+    STEP 2: AUDIT based on these STRICT criteria:
+    
+    [Trial Room Rules]
+    - FAIL if: More than 3 clothing items on desk/floor.
+    - FAIL if: Floor is dirty, dusty, or has trash.
+    - FAIL if: Mirror is dirty.
+    - PASS only if: Clean, empty desk, organized.
+
+    [Staff Grooming Rules]
+    - FAIL if: No ID Card visible.
+    - FAIL if: Shirt is untucked or wrinkled.
+    - FAIL if: Wearing casual shoes/slippers (must be formal).
+    - PASS only if: Sharp uniform, ID card present, formal look.
+
+    [Greeter Rules]
+    - FAIL if: Entrance area is empty (no staff).
+    - FAIL if: Debris or trash at entrance.
+    - PASS only if: Staff present at door, clean entrance.
+
+    [Merchandise Display Rules]
+    - FAIL if: Visual gaps/empty spaces on shelves.
+    - FAIL if: Clothes are folded messily/uneven stacks.
+    - FAIL if: Fallen items on floor.
+    - PASS only if: Fully stocked, perfectly aligned folds.
+
+    STEP 3: OUTPUT FORMAT
+    You must output exactly this format (no bolding, no markdown):
+    Category: [Name] | Result: [PASS/FAIL] | Reason: [One short sentence]
+    """
+
     try:
         discovery_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GOOGLE_API_KEY}"
         models = requests.get(discovery_url).json().get('models', [])
+        # Prefer "Flash" for speed, fall back to Pro
         model_name = next((m['name'].replace("models/", "") for m in models if "flash" in m['name']), "gemini-1.5-pro")
         
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GOOGLE_API_KEY}"
-        payload = {"contents": [{"parts": [{"text": prompt}, {"inline_data": {"mime_type": "image/jpeg", "data": img_base64}}]}]}
+        payload = {"contents": [{"parts": [{"text": system_prompt}, {"inline_data": {"mime_type": "image/jpeg", "data": img_base64}}]}]}
         
         response = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload)
         if response.status_code == 200:
@@ -49,24 +93,37 @@ def analyze_image(image, prompt):
         return f"Connection Error: {e}"
 
 # ---------------------------------------------------------
-# OPTIMIZED LOGIC: Cloud Storage (With Compression)
+# OPTIMIZED LOGIC: Cloud Storage (With Auto-Category Parsing)
 # ---------------------------------------------------------
 def save_audit_to_cloud(store_code, mgr_name, result_text, image):
     try:
-        # 1. Determine PASS/FAIL
-        status = "FAIL" if "FAIL" in result_text else "PASS"
-        
-        # 2. IMAGE COMPRESSION (The Magic Step)
-        # Resize to max 800px width (plenty for AI)
+        # 1. Parse the AI Response (Format: "Category: X | Result: Y | Reason: Z")
+        # Set defaults in case AI output is messy
+        category = "General"
+        status = "FAIL"
+        reason = result_text
+
+        if "|" in result_text:
+            parts = result_text.split("|")
+            for part in parts:
+                if "Category:" in part:
+                    category = part.replace("Category:", "").strip()
+                if "Result:" in part:
+                    status = part.replace("Result:", "").strip()
+                if "Reason:" in part:
+                    reason = part.replace("Reason:", "").strip()
+        else:
+            # Fallback for simple "FAIL" responses
+            status = "FAIL" if "FAIL" in result_text.upper() else "PASS"
+
+        # 2. Compress Image
         image = image.copy()
         image.thumbnail((800, 800)) 
-        
-        # Save as optimized JPEG
         img_byte_arr = io.BytesIO()
         image.save(img_byte_arr, format='JPEG', quality=50, optimize=True)
         img_byte_arr = img_byte_arr.getvalue()
         
-        # 3. Upload Optimized Image
+        # 3. Upload
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{store_code}_{timestamp}.jpg"
         
@@ -75,24 +132,22 @@ def save_audit_to_cloud(store_code, mgr_name, result_text, image):
             img_byte_arr, 
             {"content-type": "image/jpeg"}
         )
-        
-        # Get Public URL
         img_url = supabase.storage.from_("audit-photos").get_public_url(filename)
 
-        # 4. Insert Data Row
+        # 4. Insert Data (With the new Category!)
         data = {
             "store_code": store_code,
             "manager_name": mgr_name,
-            "audit_type": "Trial Room",
+            "audit_type": category,   # <--- Saving the auto-detected category
             "result": status,
-            "reason": result_text,
+            "reason": reason,
             "image_url": img_url,
             "created_at": datetime.now().isoformat()
         }
         supabase.table("audit_logs").insert(data).execute()
-        return True, status
+        return True, status, category, reason
     except Exception as e:
-        return False, str(e)
+        return False, str(e), "Error", "Error"
 
 # ---------------------------------------------------------
 # LOGIC: Load Store Data
@@ -140,34 +195,46 @@ def store_manager_interface():
                     st.error("Invalid Code")
     else:
         st.info(f"Store: {st.session_state['code']} | Manager: {st.session_state['mgr']}")
-        st.header("📸 Trial Room Audit")
+        st.header("📸 Smart Audit")
         
         # Nudge Reminder
         st.warning("🔔 Remember to complete audits at 11:30 AM, 2:30 PM, 5:00 PM, and 7:00 PM daily.")
 
         img_input = st.camera_input("Take Photo")
-        if img_input and st.button("Run AI Audit & Submit"):
-            with st.spinner("Analyzing and Uploading to Cloud..."):
+        
+        # --- FIXED LOGIC STARTS HERE ---
+        if img_input and st.button("Run Smart Audit"):
+            with st.spinner("AI is classifying and auditing..."):
                 image = Image.open(img_input)
-                prompt = "You are a store auditor. Count clothing items on desk/floor. If >3 answer 'FAIL: Too messy'. If <=3 answer 'PASS: Tidy'."
-                result_text = analyze_image(image, prompt)
+                
+                # 1. Run AI
+                result_text = analyze_image(image)
                 
                 if "AI Error" not in result_text:
-                    # Save to Cloud
-                    success, status = save_audit_to_cloud(st.session_state['code'], st.session_state['mgr'], result_text, image)
+                    # 2. Save & Parse (Returns 4 values)
+                    success, status, category, reason = save_audit_to_cloud(
+                        st.session_state['code'], 
+                        st.session_state['mgr'], 
+                        result_text, 
+                        image
+                    )
+                    
                     if success:
-                        if status == "FAIL":
-                            st.error(f"Audit Submitted: {status}. Cluster Manager Notified.")
+                        # 3. Show Result Card
+                        st.divider()
+                        st.subheader(f"Detected: {category}")
+                        
+                        if status == "PASS":
+                            st.success(f"✅ PASS")
+                            st.write(f"**Reason:** {reason}")
                         else:
-                            st.success(f"Audit Submitted: {status}.")
+                            st.error(f"❌ FAIL")
+                            st.write(f"**Reason:** {reason}")
+                            st.info("Action: Please fix the issue and re-audit.")
                     else:
                         st.error(f"Cloud Upload Failed: {status}")
                 else:
                     st.error(result_text)
-
-        if st.button("Logout"):
-            st.session_state['logged_in'] = False
-            st.rerun()
 
 def cluster_manager_interface():
     st.header("👀 Cluster Manager View")
