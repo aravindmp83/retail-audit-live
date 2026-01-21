@@ -244,7 +244,7 @@ def store_manager_interface():
                 else:
                     st.error(result_text)
 # ---------------------------------------------------------
-# UI: Cluster Manager Interface (Filtered & IST Time)
+# UI: Cluster Manager Interface (Fixed & Clean)
 # ---------------------------------------------------------
 def cluster_manager_interface():
     st.header("👀 Cluster Manager View")
@@ -252,17 +252,17 @@ def cluster_manager_interface():
     # 1. Load Data to get Manager Names
     df_stores = load_store_data()
     if df_stores is not None:
-        # Get unique Cluster Managers
-        # ASSUMPTION: Your CSV has a column like 'Cluster Manager' or 'CM Name'
-        # Let's try to find it dynamically or fallback to 'Cluster Manager'
+        # Auto-detect the Cluster Manager column name
+        # It looks for "Cluster" or "CM" in column names, defaults to "Cluster Manager"
         cm_col = next((col for col in df_stores.columns if "Cluster" in col or "CM" in col), "Cluster Manager")
         
+        # Check if column exists
         if cm_col not in df_stores.columns:
-            st.error(f"Could not find a 'Cluster Manager' column in stores.csv. Found: {df_stores.columns.tolist()}")
+            st.error(f"Error: Could not find a column named '{cm_col}' in stores.csv. Please check your CSV headers.")
             return
 
         # Create Dropdown
-        cms = df_stores[cm_col].unique().tolist()
+        cms = df_stores[cm_col].dropna().unique().tolist()
         cms.sort()
         selected_cm = st.selectbox("Select Your Name", cms)
         
@@ -270,10 +270,11 @@ def cluster_manager_interface():
             # Get list of stores for this CM
             my_stores = df_stores[df_stores[cm_col] == selected_cm]['Store Code'].astype(str).tolist()
             
-            # Query Supabase (Fetch ALL today's logs, then filter in Python for speed)
+            # Query Supabase
             today = datetime.now().strftime("%Y-%m-%d")
             try:
                 with st.spinner(f"Fetching audits for {selected_cm}..."):
+                    # Fetch today's logs
                     response = supabase.table("audit_logs").select("*") \
                         .filter("created_at", "gte", f"{today}T00:00:00") \
                         .order("created_at", desc=True).execute()
@@ -282,7 +283,7 @@ def cluster_manager_interface():
                 if data:
                     df_logs = pd.DataFrame(data)
                     
-                    # 2. FILTER: Keep only logs where store_code matches this CM's stores
+                    # Filter: Keep only this CM's stores
                     df_logs = df_logs[df_logs['store_code'].isin(my_stores)]
                     
                     if not df_logs.empty:
@@ -295,18 +296,18 @@ def cluster_manager_interface():
                         st.subheader(f"Detailed Logs ({len(df_logs)})")
                         
                         for index, row in df_logs.iterrows():
-                            # 3. TIMEZONE CONVERSION (UTC -> IST)
-                            utc_time = datetime.fromisoformat(row['created_at'].replace('Z', '+00:00'))
-                            ist_time = utc_time.astimezone(datetime.now().astimezone().tzinfo) # Auto-detect local TZ (IST server)
-                            # Manually force +5:30 just in case server is UTC
-                            from datetime import timedelta, timezone
-                            ist_offset = timezone(timedelta(hours=5, minutes=30))
-                            ist_time = utc_time.astimezone(ist_offset)
-                            
-                            fmt_time = ist_time.strftime("%I:%M %p") # e.g., 02:30 PM
+                            # TIMEZONE CONVERSION (UTC -> IST)
+                            try:
+                                utc_time = datetime.fromisoformat(row['created_at'].replace('Z', '+00:00'))
+                                # Manual offset for IST (+5:30)
+                                from datetime import timedelta, timezone
+                                ist_offset = timezone(timedelta(hours=5, minutes=30))
+                                ist_time = utc_time.astimezone(ist_offset)
+                                fmt_time = ist_time.strftime("%I:%M %p") 
+                            except:
+                                fmt_time = row['created_at'] # Fallback if time parsing fails
 
-                            # 4. CUSTOM HEADER FORMAT
-                            # "Store Code - Audit Type - Result"
+                            # Format Header: Store - Audit Type - Result
                             label = f"{row['store_code']} - {row['audit_type']} - {row['result']}"
                             
                             with st.expander(f"{fmt_time} | {label}"):
@@ -326,7 +327,6 @@ def cluster_manager_interface():
                 else:
                     st.info("No audits found in the system today.")
             except Exception as e:
-                st.error(f"Database Error: {e}")            except Exception as e:
                 st.error(f"Database Error: {e}")
 
 if __name__ == "__main__":
