@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from supabase import create_client, Client
 
 # ---------------------------------------------------------
-# CONFIGURATION (SECURE FOR CLOUD)
+# CONFIGURATION
 # ---------------------------------------------------------
 try:
     GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
@@ -23,17 +23,17 @@ except FileNotFoundError:
 # Initialize Cloud Backend
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-st.set_page_config(page_title="Trends Audit Live", page_icon="✅", layout="wide")
+st.set_page_config(page_title="Trends Audit Pilot", page_icon="🎯", layout="wide")
 
 # ---------------------------------------------------------
-# LOGIC: AI Analysis (Robust Multi-Model Retry)
+# LOGIC: Efficient AI Call (No Discovery Overhead)
 # ---------------------------------------------------------
 def analyze_image(image):
     buffered = io.BytesIO()
     image.save(buffered, format="JPEG")
     img_base64 = base64.b64encode(buffered.getvalue()).decode()
     
-    # THE "SMART" PROMPT (Classify & Audit)
+    # 1. THE PROMPT
     system_prompt = """
     You are a strict retail store auditor for 'Trends'. Analyze this image.
     
@@ -65,81 +65,61 @@ def analyze_image(image):
     Category: [Name] | Result: [PASS/FAIL] | Reason: [Short sentence]
     """
 
-    # PRIORITY LIST: Try these models in order until one works
-    # This fixes 404 (Not Found) and 429 (Busy) errors
-    models_to_try = [
-        "gemini-1.5-flash",
-        "gemini-1.5-flash-latest",
-        "gemini-1.5-pro", 
-        "gemini-pro" # Legacy backup
-    ]
+    # 2. THE API CALL (Hardcoded for Efficiency)
+    # We use 'gemini-1.5-flash' directly to save API credits.
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GOOGLE_API_KEY}"
+    payload = {"contents": [{"parts": [{"text": system_prompt}, {"inline_data": {"mime_type": "image/jpeg", "data": img_base64}}]}]}
     
-    for model_name in models_to_try:
-        try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GOOGLE_API_KEY}"
-            payload = {"contents": [{"parts": [{"text": system_prompt}, {"inline_data": {"mime_type": "image/jpeg", "data": img_base64}}]}]}
-            
-            # Timeout prevents it from hanging forever
-            response = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload, timeout=10)
-            
-            if response.status_code == 200:
-                # SUCCESS!
-                return response.json()['candidates'][0]['content']['parts'][0]['text']
-            
-            elif response.status_code in [429, 503]:
-                # BUSY? Wait 2 seconds and try next model
-                time.sleep(2)
-                continue
-            
-            elif response.status_code == 404:
-                # MODEL NOT FOUND? Try next model immediately
-                continue
-            
-            else:
-                # Other errors (400, 403)
-                return f"AI Error {response.status_code}"
-                
-        except Exception as e:
-            time.sleep(1)
-            continue
+    # 3. RETRY LOGIC (Simple)
+    # Try 1
+    try:
+        response = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload, timeout=15)
+        
+        # If Rate Limit (429) or Server Busy (503), wait and retry ONCE
+        if response.status_code in [429, 503]:
+            time.sleep(5) # Wait 5 seconds
+            response = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload, timeout=15)
 
-    return "System Busy. Please wait 1 minute and try again."
+        if response.status_code == 200:
+            return response.json()['candidates'][0]['content']['parts'][0]['text']
+        else:
+            return f"System Error {response.status_code}"
+
+    except Exception as e:
+        return f"Connection Error: {str(e)}"
 
 # ---------------------------------------------------------
 # LOGIC: Cloud Storage & Parsing
 # ---------------------------------------------------------
 def save_audit_to_cloud(store_code, mgr_name, result_text, image):
     try:
-        # 1. Parse AI Response
+        # Defaults
         category = "General"
-        status = "FAIL" # Default to FAIL for safety
+        status = "FAIL" 
         reason = result_text
 
-        # CRITICAL FIX: If AI failed, force FAIL status so it doesn't look compliant
-        if "AI Error" in result_text or "System Busy" in result_text:
+        # 1. PARSE AI RESULT
+        # Critical Safety: If AI failed, force FAIL status
+        if "System Error" in result_text or "Connection Error" in result_text:
             status = "FAIL"
-            reason = "System Error - Please Retry"
+            reason = "AI Service Busy - Please Retry in 1 Minute"
         elif "|" in result_text:
             parts = result_text.split("|")
             for part in parts:
-                if "Category:" in part:
-                    category = part.replace("Category:", "").strip()
-                if "Result:" in part:
-                    status = part.replace("Result:", "").strip()
-                if "Reason:" in part:
-                    reason = part.replace("Reason:", "").strip()
+                if "Category:" in part: category = part.replace("Category:", "").strip()
+                if "Result:" in part: status = part.replace("Result:", "").strip()
+                if "Reason:" in part: reason = part.replace("Reason:", "").strip()
         else:
-            # Fallback for simple responses
             status = "FAIL" if "FAIL" in result_text.upper() else "PASS"
 
-        # 2. Compress Image (Quality 50)
+        # 2. COMPRESS IMAGE (Crucial for Speed/Cost)
         image = image.copy()
         image.thumbnail((800, 800)) 
         img_byte_arr = io.BytesIO()
         image.save(img_byte_arr, format='JPEG', quality=50, optimize=True)
         img_byte_arr = img_byte_arr.getvalue()
         
-        # 3. Upload
+        # 3. UPLOAD TO SUPABASE
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{store_code}_{timestamp}.jpg"
         
@@ -150,7 +130,7 @@ def save_audit_to_cloud(store_code, mgr_name, result_text, image):
         )
         img_url = supabase.storage.from_("audit-photos").get_public_url(filename)
 
-        # 4. Insert Data
+        # 4. INSERT LOG
         data = {
             "store_code": store_code,
             "manager_name": mgr_name,
@@ -179,10 +159,10 @@ def load_store_data():
         return None
 
 # ---------------------------------------------------------
-# MAIN APP UI
+# UI
 # ---------------------------------------------------------
 def main():
-    st.title("✅ Trends Store Audit")
+    st.title("🎯 Trends Audit Pilot")
 
     role = st.sidebar.radio("Select Role", ["Store Manager", "Cluster Manager"])
 
@@ -210,16 +190,15 @@ def store_manager_interface():
                     st.error("Invalid Code")
     else:
         st.info(f"Store: {st.session_state['code']} | Manager: {st.session_state['mgr']}")
-        st.header("📸 Run Audit")
+        st.header("📸 Smart Audit")
         
         img_input = st.camera_input("Take Photo")
         
-        if img_input and st.button("Run Smart Audit"):
-            with st.spinner("AI is checking rules..."):
+        if img_input and st.button("Run Audit"):
+            with st.spinner("Analyzing..."):
                 image = Image.open(img_input)
                 result_text = analyze_image(image)
                 
-                # Save & Parse
                 success, status, category, reason = save_audit_to_cloud(
                     st.session_state['code'], 
                     st.session_state['mgr'], 
@@ -235,12 +214,11 @@ def store_manager_interface():
                         st.success(f"✅ PASS")
                         st.write(f"**Reason:** {reason}")
                     else:
-                        st.error(f"❌ FAIL / ACTION REQUIRED")
+                        st.error(f"❌ {status}") # Will show 'FAIL' or 'SYSTEM ERROR'
                         st.write(f"**Reason:** {reason}")
-                        if "System Error" in reason:
-                            st.warning("⚠️ The AI system is busy. Please wait 1 minute and try again.")
-                        else:
-                            st.info("Action: Please fix the issue and re-audit.")
+                        
+                        if "AI Service Busy" in reason:
+                            st.warning("⚠️ High Traffic. Please wait 60 seconds and try again.")
                 else:
                     st.error(f"Upload Failed: {status}")
 
@@ -257,17 +235,16 @@ def cluster_manager_interface():
         cm_col = next((col for col in df_stores.columns if "Cluster" in col or "CM" in col), "Cluster Manager")
         
         if cm_col in df_stores.columns:
-            # Dropdown for CMs
             cms = df_stores[cm_col].dropna().unique().tolist()
             cms.sort()
             selected_cm = st.selectbox("Select Your Name", cms)
             
-            if st.button("Load My Data"):
+            if st.button("Load Data"):
                 my_stores = df_stores[df_stores[cm_col] == selected_cm]['Store Code'].astype(str).tolist()
                 today = datetime.now().strftime("%Y-%m-%d")
                 
                 try:
-                    with st.spinner("Fetching data..."):
+                    with st.spinner("Fetching..."):
                         response = supabase.table("audit_logs").select("*") \
                             .filter("created_at", "gte", f"{today}T00:00:00") \
                             .order("created_at", desc=True).execute()
@@ -275,13 +252,12 @@ def cluster_manager_interface():
                     data = response.data
                     if data:
                         df_logs = pd.DataFrame(data)
-                        # Filter for selected CM
                         df_logs = df_logs[df_logs['store_code'].isin(my_stores)]
                         
                         if not df_logs.empty:
                             st.metric("Total Audits", len(df_logs))
                             fails = len(df_logs[df_logs['result'] == 'FAIL'])
-                            st.metric("Issues Found", fails, delta=-fails, delta_color="inverse")
+                            st.metric("Issues", fails, delta=-fails, delta_color="inverse")
                             
                             st.divider()
                             for index, row in df_logs.iterrows():
@@ -304,13 +280,13 @@ def cluster_manager_interface():
                                         st.write(f"**Reason:** {row['reason']}")
                                         if row['result'] == 'FAIL': st.error("Action Required")
                         else:
-                            st.info("No data found for your stores today.")
+                            st.info("No data found.")
                     else:
-                        st.info("No audits found today.")
+                        st.info("No audits found.")
                 except Exception as e:
                     st.error(f"Database Error: {e}")
         else:
-            st.error("Column 'Cluster Manager' not found in CSV.")
+            st.error("Column 'Cluster Manager' not found.")
 
 if __name__ == "__main__":
     main()
