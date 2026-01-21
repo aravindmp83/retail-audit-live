@@ -26,7 +26,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 st.set_page_config(page_title="Trends Audit V2", page_icon="✅", layout="wide")
 
 # ---------------------------------------------------------
-# LOGIC: AI Analysis (With "Patience" & Auto-Failover)
+# LOGIC: AI Analysis (Updated to Fix 404 Errors)
 # ---------------------------------------------------------
 def analyze_image(image, prompt_override=None):
     buffered = io.BytesIO()
@@ -73,8 +73,9 @@ def analyze_image(image, prompt_override=None):
     Category: [Name] | Result: [PASS/FAIL] | Reason: [One short sentence]
     """
 
-    # PRIORITY LIST: Flash (Fastest) -> Flash-8b (Backup) -> Pro (Strongest)
-    models_to_try = ["gemini-1.5-flash", "gemini-1.5-flash-8b", "gemini-1.5-pro"]
+    # PRIORITY LIST: Flash -> Flash-8b -> Pro -> Pro-002
+    # We added more aliases to ensure one ALWAYS works
+    models_to_try = ["gemini-1.5-flash", "gemini-1.5-flash-002", "gemini-1.5-flash-8b", "gemini-1.5-pro"]
     
     for model_name in models_to_try:
         try:
@@ -86,9 +87,9 @@ def analyze_image(image, prompt_override=None):
             if response.status_code == 200:
                 return response.json()['candidates'][0]['content']['parts'][0]['text']
             
-            elif response.status_code in [429, 503]:
-                # HIT TRAFFIC? WAIT 2 SECONDS AND TRY NEXT MODEL
-                time.sleep(2)
+            # THE FIX: Added 404 to this list so it tries the next model instead of quitting
+            elif response.status_code in [429, 503, 404]:
+                time.sleep(1)
                 continue
             
             else:
@@ -98,7 +99,7 @@ def analyze_image(image, prompt_override=None):
             time.sleep(1)
             continue
 
-    return "System Busy (Traffic High). Please wait 30 seconds and try again."
+    return "System Busy. Please wait 30 seconds and try again."
 
 # ---------------------------------------------------------
 # OPTIMIZED LOGIC: Cloud Storage (With Auto-Category Parsing)
