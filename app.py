@@ -23,91 +23,76 @@ except FileNotFoundError:
 # Initialize Cloud Backend
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-st.set_page_config(page_title="Trends Audit Pilot", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="Trends Audit Debug", page_icon="🐞", layout="wide")
 
 # ---------------------------------------------------------
-# LOGIC: Traffic Dodge AI (Tries 3 distinct models)
+# LOGIC: DEBUG AI (Prints Raw Errors)
 # ---------------------------------------------------------
 def analyze_image(image):
-    # 1. OPTIMIZE IMAGE (Aggressive resize for speed)
+    # 1. OPTIMIZE IMAGE
     img_small = image.copy()
     img_small.thumbnail((800, 800))
-    
     buffered = io.BytesIO()
     img_small.save(buffered, format="JPEG", quality=60, optimize=True)
     img_base64 = base64.b64encode(buffered.getvalue()).decode()
     
-    # 2. THE PROMPT
+    # 2. PROMPT
     system_prompt = """
     You are a strict retail store auditor for 'Trends'. Analyze this image.
-    
-    STEP 1: CLASSIFY the image into exactly one of these categories:
-    - 'Trial Room' (Look for desks, mirrors, cubicles)
-    - 'Staff Grooming' (Look for a person, uniform, ID card)
-    - 'Greeter' (Look for store entrance, security guard)
-    - 'Merchandise Display' (Look for shelves, clothes stacks)
-
-    STEP 2: AUDIT based on these STRICT criteria:
-    
-    [Trial Room]
-    - FAIL if: >3 items on desk/floor, trash visible, dirty mirror.
-    - PASS only if: Clean, empty desk, organized.
-
-    [Staff Grooming]
-    - FAIL if: No ID Card, untucked shirt, casual shoes.
-    - PASS only if: Sharp uniform, ID card visible.
-
-    [Greeter]
-    - FAIL if: Entrance empty (no staff), trash at door.
-    - PASS only if: Staff present, clean entrance.
-
-    [Merchandise Display]
-    - FAIL if: Gaps on shelves, messy stacks, fallen items.
-    - PASS only if: Fully stocked, aligned.
-
-    STEP 3: OUTPUT FORMAT (Strictly):
-    Category: [Name] | Result: [PASS/FAIL] | Reason: [Short sentence]
+    STEP 1: CLASSIFY: 'Trial Room', 'Staff Grooming', 'Greeter', 'Merchandise Display'.
+    STEP 2: AUDIT based on strict rules.
+    STEP 3: OUTPUT FORMAT: Category: [Name] | Result: [PASS/FAIL] | Reason: [Short sentence]
     """
 
-    # 3. THE MODEL LIST (The "Lanes")
-    # Lane 1: The new "Lightweight" model (Less crowded)
-    # Lane 2: The standard model
-    # Lane 3: The old reliable model (Legacy)
-    models = ["gemini-1.5-flash-8b", "gemini-1.5-flash", "gemini-1.0-pro"]
+    # 3. MODEL LIST (Only Multimodal Models)
+    # We added 'gemini-2.0-flash-exp' which is often free and empty!
+    models = ["gemini-1.5-flash", "gemini-1.5-flash-8b", "gemini-2.0-flash-exp"]
+
+    last_error = ""
 
     for model in models:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GOOGLE_API_KEY}"
         payload = {"contents": [{"parts": [{"text": system_prompt}, {"inline_data": {"mime_type": "image/jpeg", "data": img_base64}}]}]}
         
         try:
-            # Short timeout to fail fast and try next model
-            response = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload, timeout=8)
-            
-            if response.status_code == 200:
-                return response.json()['candidates'][0]['content']['parts'][0]['text']
-            
-            # If busy, just loop to the next model immediately
+            # We use a placeholder for status to show the user what's happening
+            with st.status(f"Trying AI Model: {model}...", expanded=True) as status:
+                response = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload, timeout=10)
+                
+                if response.status_code == 200:
+                    status.update(label="Success!", state="complete", expanded=False)
+                    return response.json()['candidates'][0]['content']['parts'][0]['text']
+                
+                else:
+                    # CAPTURE THE RAW ERROR
+                    error_msg = f"Model {model} failed: {response.text}"
+                    st.write(error_msg) # Print error to screen for debugging
+                    last_error = error_msg
+                    status.update(label="Busy/Failed", state="error", expanded=False)
+                    continue
+
+        except Exception as e:
+            last_error = str(e)
             continue
 
-        except Exception:
-            continue
-
-    return "System Error: All AI lanes are busy. Please try again in 1 minute."
+    # If we get here, ALL models failed. Return the RAW error to the user.
+    return f"DEBUG_ERROR: {last_error}"
 
 # ---------------------------------------------------------
-# LOGIC: Cloud Storage & Parsing
+# LOGIC: Cloud Storage
 # ---------------------------------------------------------
 def save_audit_to_cloud(store_code, mgr_name, result_text, image):
     try:
-        # Defaults
         category = "General"
         status = "FAIL" 
         reason = result_text
 
-        # 1. PARSE AI RESULT
-        if "System Error" in result_text or "Connection Error" in result_text:
+        # 1. PARSE RESULT
+        # If the result starts with DEBUG_ERROR, we know it failed.
+        if "DEBUG_ERROR" in result_text or "Connection Error" in result_text:
             status = "FAIL"
-            reason = "AI Service Busy - Please Retry"
+            # We save the raw error to the database reason so we can see it in logs too
+            reason = result_text[:100] + "..." # Truncate if too long
         elif "|" in result_text:
             parts = result_text.split("|")
             for part in parts:
@@ -117,25 +102,22 @@ def save_audit_to_cloud(store_code, mgr_name, result_text, image):
         else:
             status = "FAIL" if "FAIL" in result_text.upper() else "PASS"
 
-        # 2. COMPRESS IMAGE (For Cloud Storage)
+        # 2. UPLOAD IMAGE
         image = image.copy()
         image.thumbnail((800, 800)) 
         img_byte_arr = io.BytesIO()
         image.save(img_byte_arr, format='JPEG', quality=50, optimize=True)
         img_byte_arr = img_byte_arr.getvalue()
         
-        # 3. UPLOAD TO SUPABASE
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{store_code}_{timestamp}.jpg"
         
         supabase.storage.from_("audit-photos").upload(
-            filename, 
-            img_byte_arr, 
-            {"content-type": "image/jpeg"}
+            filename, img_byte_arr, {"content-type": "image/jpeg"}
         )
         img_url = supabase.storage.from_("audit-photos").get_public_url(filename)
 
-        # 4. INSERT LOG
+        # 3. INSERT DATA
         data = {
             "store_code": store_code,
             "manager_name": mgr_name,
@@ -151,7 +133,7 @@ def save_audit_to_cloud(store_code, mgr_name, result_text, image):
         return False, str(e), "Error", "Error"
 
 # ---------------------------------------------------------
-# DATA LOADER
+# UI & HELPERS
 # ---------------------------------------------------------
 @st.cache_data
 def load_store_data():
@@ -163,11 +145,8 @@ def load_store_data():
     except:
         return None
 
-# ---------------------------------------------------------
-# UI
-# ---------------------------------------------------------
 def main():
-    st.title("🎯 Trends Audit Pilot")
+    st.title("🐞 Trends Audit (Debug Mode)")
 
     role = st.sidebar.radio("Select Role", ["Store Manager", "Cluster Manager"])
 
@@ -195,34 +174,34 @@ def store_manager_interface():
                     st.error("Invalid Code")
     else:
         st.info(f"Store: {st.session_state['code']} | Manager: {st.session_state['mgr']}")
-        st.header("📸 Smart Audit")
         
         img_input = st.camera_input("Take Photo")
         
         if img_input and st.button("Run Audit"):
-            with st.spinner("Analyzing..."):
-                image = Image.open(img_input)
-                result_text = analyze_image(image)
-                
-                success, status, category, reason = save_audit_to_cloud(
-                    st.session_state['code'], 
-                    st.session_state['mgr'], 
-                    result_text, 
-                    image
-                )
-                
-                if success:
-                    st.divider()
-                    st.subheader(f"Detected: {category}")
-                    
-                    if status == "PASS":
-                        st.success(f"✅ PASS")
-                        st.write(f"**Reason:** {reason}")
-                    else:
-                        st.error(f"❌ {status}")
-                        st.write(f"**Reason:** {reason}")
+            # We removed the spinner so the 'status' container inside analyze_image works
+            image = Image.open(img_input)
+            result_text = analyze_image(image)
+            
+            success, status, category, reason = save_audit_to_cloud(
+                st.session_state['code'], 
+                st.session_state['mgr'], 
+                result_text, 
+                image
+            )
+            
+            if success:
+                st.divider()
+                st.subheader(f"Detected: {category}")
+                if status == "PASS":
+                    st.success(f"✅ PASS")
+                    st.write(f"**Reason:** {reason}")
                 else:
-                    st.error(f"Upload Failed: {status}")
+                    st.error(f"❌ {status}")
+                    st.write(f"**Reason:** {reason}")
+                    if "DEBUG_ERROR" in reason:
+                        st.warning("Please screenshot the error above and share it.")
+            else:
+                st.error(f"Upload Failed: {status}")
 
         if st.button("Logout"):
             st.session_state['logged_in'] = False
@@ -230,63 +209,27 @@ def store_manager_interface():
 
 def cluster_manager_interface():
     st.header("👀 Cluster Manager View")
-    
     df_stores = load_store_data()
     if df_stores is not None:
         cm_col = next((col for col in df_stores.columns if "Cluster" in col or "CM" in col), "Cluster Manager")
-        
         if cm_col in df_stores.columns:
             cms = df_stores[cm_col].dropna().unique().tolist()
             cms.sort()
             selected_cm = st.selectbox("Select Your Name", cms)
-            
             if st.button("Load Data"):
                 my_stores = df_stores[df_stores[cm_col] == selected_cm]['Store Code'].astype(str).tolist()
                 today = datetime.now().strftime("%Y-%m-%d")
-                
                 try:
-                    with st.spinner("Fetching..."):
-                        response = supabase.table("audit_logs").select("*") \
-                            .filter("created_at", "gte", f"{today}T00:00:00") \
-                            .order("created_at", desc=True).execute()
-                    
+                    response = supabase.table("audit_logs").select("*").filter("created_at", "gte", f"{today}T00:00:00").order("created_at", desc=True).execute()
                     data = response.data
                     if data:
                         df_logs = pd.DataFrame(data)
                         df_logs = df_logs[df_logs['store_code'].isin(my_stores)]
-                        
                         if not df_logs.empty:
-                            st.metric("Total Audits", len(df_logs))
-                            fails = len(df_logs[df_logs['result'] == 'FAIL'])
-                            st.metric("Issues", fails, delta=-fails, delta_color="inverse")
-                            
-                            st.divider()
-                            for index, row in df_logs.iterrows():
-                                try:
-                                    utc_time = datetime.fromisoformat(row['created_at'].replace('Z', '+00:00'))
-                                    ist_offset = timezone(timedelta(hours=5, minutes=30))
-                                    ist_time = utc_time.astimezone(ist_offset)
-                                    fmt_time = ist_time.strftime("%I:%M %p") 
-                                except:
-                                    fmt_time = "Time Error"
-
-                                label = f"{row['store_code']} - {row['audit_type']} - {row['result']}"
-                                with st.expander(f"{fmt_time} | {label}"):
-                                    col1, col2 = st.columns([1, 2])
-                                    with col1:
-                                        if row['image_url']: st.image(row['image_url'], width=200)
-                                    with col2:
-                                        st.write(f"**Manager:** {row['manager_name']}")
-                                        st.write(f"**Reason:** {row['reason']}")
-                                        if row['result'] == 'FAIL': st.error("Action Required")
-                        else:
-                            st.info("No data found.")
-                    else:
-                        st.info("No audits found.")
-                except Exception as e:
-                    st.error(f"Database Error: {e}")
-        else:
-            st.error("Column 'Cluster Manager' not found.")
+                            st.dataframe(df_logs[['store_code', 'audit_type', 'result', 'reason']])
+                        else: st.info("No data.")
+                    else: st.info("No data.")
+                except Exception as e: st.error(f"DB Error: {e}")
 
 if __name__ == "__main__":
     main()
