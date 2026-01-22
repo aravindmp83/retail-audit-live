@@ -26,16 +26,14 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 st.set_page_config(page_title="Trends Audit Pilot", page_icon="🎯", layout="wide")
 
 # ---------------------------------------------------------
-# LOGIC: Efficient AI Call (Compressed + Long Wait)
+# LOGIC: Traffic Dodge AI (Tries 3 distinct models)
 # ---------------------------------------------------------
 def analyze_image(image):
-    # 1. OPTIMIZE IMAGE (Resize BEFORE sending to Google)
-    # This reduces 4MB phone photos to ~50KB, speeding up the API call significantly.
+    # 1. OPTIMIZE IMAGE (Aggressive resize for speed)
     img_small = image.copy()
-    img_small.thumbnail((800, 800))  # Max 800px (Plenty for AI)
+    img_small.thumbnail((800, 800))
     
     buffered = io.BytesIO()
-    # Quality=60 is the "sweet spot" for AI (low file size, high readability)
     img_small.save(buffered, format="JPEG", quality=60, optimize=True)
     img_base64 = base64.b64encode(buffered.getvalue()).decode()
     
@@ -71,26 +69,30 @@ def analyze_image(image):
     Category: [Name] | Result: [PASS/FAIL] | Reason: [Short sentence]
     """
 
-    # 3. THE API CALL
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GOOGLE_API_KEY}"
-    payload = {"contents": [{"parts": [{"text": system_prompt}, {"inline_data": {"mime_type": "image/jpeg", "data": img_base64}}]}]}
-    
-    # 4. RETRY LOGIC (30 Seconds Wait)
-    try:
-        response = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload, timeout=20)
+    # 3. THE MODEL LIST (The "Lanes")
+    # Lane 1: The new "Lightweight" model (Less crowded)
+    # Lane 2: The standard model
+    # Lane 3: The old reliable model (Legacy)
+    models = ["gemini-1.5-flash-8b", "gemini-1.5-flash", "gemini-1.0-pro"]
+
+    for model in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GOOGLE_API_KEY}"
+        payload = {"contents": [{"parts": [{"text": system_prompt}, {"inline_data": {"mime_type": "image/jpeg", "data": img_base64}}]}]}
         
-        # If Rate Limit (429) or Server Busy (503), wait 30s and retry ONCE
-        if response.status_code in [429, 503]:
-            time.sleep(30) # <--- UPDATED TO 30 SECONDS
-            response = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload, timeout=20)
+        try:
+            # Short timeout to fail fast and try next model
+            response = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload, timeout=8)
+            
+            if response.status_code == 200:
+                return response.json()['candidates'][0]['content']['parts'][0]['text']
+            
+            # If busy, just loop to the next model immediately
+            continue
 
-        if response.status_code == 200:
-            return response.json()['candidates'][0]['content']['parts'][0]['text']
-        else:
-            return f"System Error {response.status_code}"
+        except Exception:
+            continue
 
-    except Exception as e:
-        return f"Connection Error: {str(e)}"
+    return "System Error: All AI lanes are busy. Please try again in 1 minute."
 
 # ---------------------------------------------------------
 # LOGIC: Cloud Storage & Parsing
@@ -105,7 +107,7 @@ def save_audit_to_cloud(store_code, mgr_name, result_text, image):
         # 1. PARSE AI RESULT
         if "System Error" in result_text or "Connection Error" in result_text:
             status = "FAIL"
-            reason = "AI Service Busy - Please Retry Later"
+            reason = "AI Service Busy - Please Retry"
         elif "|" in result_text:
             parts = result_text.split("|")
             for part in parts:
@@ -198,7 +200,7 @@ def store_manager_interface():
         img_input = st.camera_input("Take Photo")
         
         if img_input and st.button("Run Audit"):
-            with st.spinner("Analyzing (This may take 30s)..."):
+            with st.spinner("Analyzing..."):
                 image = Image.open(img_input)
                 result_text = analyze_image(image)
                 
@@ -219,9 +221,6 @@ def store_manager_interface():
                     else:
                         st.error(f"❌ {status}")
                         st.write(f"**Reason:** {reason}")
-                        
-                        if "AI Service Busy" in reason:
-                            st.warning("⚠️ High Traffic. The app waited 30s but Google is still busy. Please try again.")
                 else:
                     st.error(f"Upload Failed: {status}")
 
