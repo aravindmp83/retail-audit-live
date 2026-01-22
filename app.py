@@ -26,16 +26,20 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 st.set_page_config(page_title="Trends Audit Pilot", page_icon="🎯", layout="wide")
 
 # ---------------------------------------------------------
-# LOGIC: Efficient AI Call (No Discovery Overhead)
+# LOGIC: Efficient AI Call (Compressed + Long Wait)
 # ---------------------------------------------------------
 def analyze_image(image):
-     image = image.copy()
-    image.thumbnail((640, 640))   # 🔥 resize BEFORE API call
- buffered = io.BytesIO()
-    image.save(buffered, format="JPEG")
+    # 1. OPTIMIZE IMAGE (Resize BEFORE sending to Google)
+    # This reduces 4MB phone photos to ~50KB, speeding up the API call significantly.
+    img_small = image.copy()
+    img_small.thumbnail((800, 800))  # Max 800px (Plenty for AI)
+    
+    buffered = io.BytesIO()
+    # Quality=60 is the "sweet spot" for AI (low file size, high readability)
+    img_small.save(buffered, format="JPEG", quality=60, optimize=True)
     img_base64 = base64.b64encode(buffered.getvalue()).decode()
     
-    # 1. THE PROMPT
+    # 2. THE PROMPT
     system_prompt = """
     You are a strict retail store auditor for 'Trends'. Analyze this image.
     
@@ -67,20 +71,18 @@ def analyze_image(image):
     Category: [Name] | Result: [PASS/FAIL] | Reason: [Short sentence]
     """
 
-    # 2. THE API CALL (Hardcoded for Efficiency)
-    # We use 'gemini-1.5-flash' directly to save API credits.
+    # 3. THE API CALL
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GOOGLE_API_KEY}"
     payload = {"contents": [{"parts": [{"text": system_prompt}, {"inline_data": {"mime_type": "image/jpeg", "data": img_base64}}]}]}
     
-    # 3. RETRY LOGIC (Simple)
-    # Try 1
+    # 4. RETRY LOGIC (30 Seconds Wait)
     try:
-        response = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload, timeout=15)
+        response = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload, timeout=20)
         
-        # If Rate Limit (429) or Server Busy (503), wait and retry ONCE
+        # If Rate Limit (429) or Server Busy (503), wait 30s and retry ONCE
         if response.status_code in [429, 503]:
-            time.sleep(30) # Wait 30 seconds
-            response = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload, timeout=15)
+            time.sleep(30) # <--- UPDATED TO 30 SECONDS
+            response = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload, timeout=20)
 
         if response.status_code == 200:
             return response.json()['candidates'][0]['content']['parts'][0]['text']
@@ -101,10 +103,9 @@ def save_audit_to_cloud(store_code, mgr_name, result_text, image):
         reason = result_text
 
         # 1. PARSE AI RESULT
-        # Critical Safety: If AI failed, force FAIL status
         if "System Error" in result_text or "Connection Error" in result_text:
             status = "FAIL"
-            reason = "AI Service Busy - Please Retry in 1 Minute"
+            reason = "AI Service Busy - Please Retry Later"
         elif "|" in result_text:
             parts = result_text.split("|")
             for part in parts:
@@ -114,7 +115,7 @@ def save_audit_to_cloud(store_code, mgr_name, result_text, image):
         else:
             status = "FAIL" if "FAIL" in result_text.upper() else "PASS"
 
-        # 2. COMPRESS IMAGE (Crucial for Speed/Cost)
+        # 2. COMPRESS IMAGE (For Cloud Storage)
         image = image.copy()
         image.thumbnail((800, 800)) 
         img_byte_arr = io.BytesIO()
@@ -197,7 +198,7 @@ def store_manager_interface():
         img_input = st.camera_input("Take Photo")
         
         if img_input and st.button("Run Audit"):
-            with st.spinner("Analyzing..."):
+            with st.spinner("Analyzing (This may take 30s)..."):
                 image = Image.open(img_input)
                 result_text = analyze_image(image)
                 
@@ -216,11 +217,11 @@ def store_manager_interface():
                         st.success(f"✅ PASS")
                         st.write(f"**Reason:** {reason}")
                     else:
-                        st.error(f"❌ {status}") # Will show 'FAIL' or 'SYSTEM ERROR'
+                        st.error(f"❌ {status}")
                         st.write(f"**Reason:** {reason}")
                         
                         if "AI Service Busy" in reason:
-                            st.warning("⚠️ High Traffic. Please wait 60 seconds and try again.")
+                            st.warning("⚠️ High Traffic. The app waited 30s but Google is still busy. Please try again.")
                 else:
                     st.error(f"Upload Failed: {status}")
 
@@ -233,7 +234,6 @@ def cluster_manager_interface():
     
     df_stores = load_store_data()
     if df_stores is not None:
-        # Find CM Column
         cm_col = next((col for col in df_stores.columns if "Cluster" in col or "CM" in col), "Cluster Manager")
         
         if cm_col in df_stores.columns:
@@ -263,7 +263,6 @@ def cluster_manager_interface():
                             
                             st.divider()
                             for index, row in df_logs.iterrows():
-                                # IST Time Conversion
                                 try:
                                     utc_time = datetime.fromisoformat(row['created_at'].replace('Z', '+00:00'))
                                     ist_offset = timezone(timedelta(hours=5, minutes=30))
@@ -292,4 +291,3 @@ def cluster_manager_interface():
 
 if __name__ == "__main__":
     main()
-
