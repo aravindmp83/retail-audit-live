@@ -13,12 +13,10 @@ from supabase import create_client, Client
 # CONFIGURATION (Supports both flat and nested secrets)
 # ---------------------------------------------------------
 try:
-    # Try flat structure first
     if "GOOGLE_API_KEY" in st.secrets:
         GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
         SUPABASE_URL = st.secrets["SUPABASE_URL"]
         SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
-    # Fallback to nested structure from your other app
     else:
         GOOGLE_API_KEY = st.secrets["google"]["api_key"]
         SUPABASE_URL = st.secrets["supabase"]["url"]
@@ -42,7 +40,6 @@ def get_best_model_name():
         response = requests.get(url)
         if response.status_code == 200:
             models = response.json().get('models', [])
-            # Priority: 1.5-flash -> flash-latest -> 1.5-pro
             for preferred in ["gemini-1.5-flash", "flash-latest", "gemini-1.5-pro"]:
                 for m in models:
                     name = m['name'].replace("models/", "")
@@ -78,7 +75,6 @@ def analyze_image(image):
     try:
         response = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload, timeout=20)
         
-        # Simple Retry for busy server
         if response.status_code in [429, 503]:
             time.sleep(5) 
             response = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload, timeout=20)
@@ -86,7 +82,6 @@ def analyze_image(image):
         if response.status_code == 200:
             return response.json()['candidates'][0]['content']['parts'][0]['text']
         else:
-            # SHOW RAW ERROR FOR DEBUGGING
             return f"AI_DEBUG_ERROR {response.status_code}: {response.text}"
 
     except Exception as e:
@@ -104,7 +99,6 @@ def save_audit_to_cloud(store_code, mgr_name, result_text, image):
         # 1. PARSE RESULT (Now shows raw errors)
         if "DEBUG_ERROR" in result_text:
             status = "FAIL"
-            # We no longer hide the error behind "System Busy"
             reason = result_text 
         elif "|" in result_text:
             parts = result_text.split("|")
@@ -141,7 +135,9 @@ def save_audit_to_cloud(store_code, mgr_name, result_text, image):
     except Exception as e:
         return False, str(e), "Error", "Error"
 
-# --- REMAINDER OF YOUR UI CODE ---
+# ---------------------------------------------------------
+# DATA LOADER
+# ---------------------------------------------------------
 @st.cache_data
 def load_store_data():
     try:
@@ -151,6 +147,9 @@ def load_store_data():
         return df
     except: return None
 
+# ---------------------------------------------------------
+# UI
+# ---------------------------------------------------------
 def main():
     st.title("✅ Trends Audit Live")
     role = st.sidebar.radio("Select Role", ["Store Manager", "Cluster Manager"])
@@ -194,30 +193,78 @@ def store_manager_interface():
 def cluster_manager_interface():
     st.header("👀 Cluster Manager View")
     df_stores = load_store_data()
+    
     if df_stores is not None:
         cm_col = next((col for col in df_stores.columns if "Cluster" in col or "CM" in col), "Cluster Manager")
         if cm_col in df_stores.columns:
+            
+            # --- NEW DEMO FEATURE: TIME FILTER ---
+            st.markdown("### Filter Data")
+            col_name, col_time = st.columns(2)
+            
             cms = df_stores[cm_col].dropna().unique().tolist()
             cms.sort()
-            selected_cm = st.selectbox("Select Your Name", cms)
-            if st.button("Load Data"):
+            with col_name:
+                selected_cm = st.selectbox("Select Your Name", cms)
+            with col_time:
+                time_filter = st.selectbox("Time Range", ["Today", "Last 7 Days", "All Time"])
+            
+            if st.button("Load Data", type="primary"):
                 my_stores = df_stores[df_stores[cm_col] == selected_cm]['Store Code'].astype(str).tolist()
-                today = datetime.now().strftime("%Y-%m-%d")
+                
+                # Calculate Date Filter
+                if time_filter == "Today":
+                    start_date = datetime.now().strftime("%Y-%m-%d")
+                elif time_filter == "Last 7 Days":
+                    start_date = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+                else:
+                    start_date = "2000-01-01" # All time
+                
                 try:
-                    response = supabase.table("audit_logs").select("*").filter("created_at", "gte", f"{today}T00:00:00").order("created_at", desc=True).execute()
+                    # Query Supabase with the dynamic date
+                    with st.spinner("Fetching historical data..."):
+                        query = supabase.table("audit_logs").select("*").order("created_at", desc=True)
+                        if time_filter != "All Time":
+                            query = query.filter("created_at", "gte", f"{start_date}T00:00:00")
+                        
+                        response = query.execute()
+                        
                     if response.data:
                         df_logs = pd.DataFrame(response.data)
+                        # Filter by this manager's stores
                         df_logs = df_logs[df_logs['store_code'].isin(my_stores)]
+                        
                         if not df_logs.empty:
-                            st.metric("Total Audits", len(df_logs))
+                            st.divider()
+                            st.metric(f"Total Audits ({time_filter})", len(df_logs))
+                            
+                            # Display the logs
                             for index, row in df_logs.iterrows():
-                                with st.expander(f"{row['store_code']} - {row['result']}"):
-                                    st.image(row['image_url'], width=200)
-                                    st.write(f"**Reason:** {row['reason']}")
-                        else: st.info("No data.")
-                    else: st.info("No audits.")
-                except Exception as e: st.error(f"DB Error: {e}")
-        else: st.error("Column 'Cluster Manager' not found.")
+                                # Try to format time beautifully to IST
+                                try:
+                                    utc_time = datetime.fromisoformat(row['created_at'].replace('Z', '+00:00'))
+                                    ist_offset = timezone(timedelta(hours=5, minutes=30))
+                                    ist_time = utc_time.astimezone(ist_offset)
+                                    fmt_time = ist_time.strftime("%d-%b-%Y | %I:%M %p") 
+                                except:
+                                    fmt_time = row['created_at']
+
+                                label = f"{fmt_time} | Store: {row['store_code']} | Result: {row['result']}"
+                                
+                                with st.expander(label):
+                                    c1, c2 = st.columns([1, 2])
+                                    with c1:
+                                        if row['image_url']: st.image(row['image_url'], width=200)
+                                    with c2:
+                                        st.write(f"**Audit Type:** {row['audit_type']}")
+                                        st.write(f"**Manager:** {row['manager_name']}")
+                                        st.write(f"**Reason:** {row['reason']}")
+                                        if row['result'] == 'FAIL': 
+                                            st.error("Action Required")
+                        else: st.info(f"No data found for {selected_cm} in the selected time range.")
+                    else: st.info("No audits found in the database yet.")
+                except Exception as e: st.error(f"Database Error: {e}")
+        else: st.error("Column 'Cluster Manager' not found in stores.csv.")
 
 if __name__ == "__main__":
     main()
